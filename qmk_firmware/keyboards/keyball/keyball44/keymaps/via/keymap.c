@@ -24,18 +24,22 @@ enum custom_keycodes {
     RAPID_CLICK = SAFE_RANGE,
 };
 
-// Alternate down/up every 50 ms: 10 left clicks per second.
-#define RAPID_CLICK_HALF_PERIOD_MS 50
+#define RAPID_CLICK_DEFAULT_RATE 30
+#define RAPID_CLICK_MIN_RATE 1
+#define RAPID_CLICK_MAX_RATE 120
 
 static bool rapid_click_active;
 static bool rapid_click_down;
 static uint16_t rapid_click_timer;
+static uint16_t rapid_click_phase;
+static uint8_t rapid_click_rate = RAPID_CLICK_DEFAULT_RATE;
 
 static void rapid_click_stop(void) {
     if (rapid_click_active) {
         unregister_code(KC_BTN1);
         rapid_click_active = false;
         rapid_click_down = false;
+        keyball_set_scroll_mode(get_highest_layer(layer_state) == 3);
     }
 }
 
@@ -48,6 +52,8 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         rapid_click_active = true;
         rapid_click_down = true;
         rapid_click_timer = timer_read();
+        rapid_click_phase = 0;
+        keyball_set_scroll_mode(true);
         register_code(KC_BTN1);
     } else {
         rapid_click_stop();
@@ -60,17 +66,41 @@ bool is_mouse_record_user(uint16_t keycode, keyrecord_t *record) {
 }
 
 void matrix_scan_user(void) {
-    if (!rapid_click_active || timer_elapsed(rapid_click_timer) < RAPID_CLICK_HALF_PERIOD_MS) {
+    if (!rapid_click_active) {
         return;
     }
 
-    rapid_click_timer = timer_read();
+    // Fractional half-periods keep 30/s accurate instead of rounding to 31.25/s.
+    uint16_t now = timer_read();
+    uint32_t phase = rapid_click_phase + (uint32_t)(uint16_t)(now - rapid_click_timer) * rapid_click_rate;
+    rapid_click_timer = now;
+    rapid_click_phase = phase % 500;
+    if (phase < 500) {
+        return;
+    }
+
     rapid_click_down = !rapid_click_down;
     if (rapid_click_down) {
         register_code(KC_BTN1);
     } else {
         unregister_code(KC_BTN1);
     }
+}
+
+report_mouse_t pointing_device_task_user(report_mouse_t report) {
+    if (rapid_click_active) {
+        // One vertical wheel tick changes the rate by one click per second.
+        int16_t rate = rapid_click_rate + report.v;
+        if (rate < RAPID_CLICK_MIN_RATE) {
+            rate = RAPID_CLICK_MIN_RATE;
+        } else if (rate > RAPID_CLICK_MAX_RATE) {
+            rate = RAPID_CLICK_MAX_RATE;
+        }
+        rapid_click_rate = rate;
+        report.h = 0;
+        report.v = 0;
+    }
+    return report;
 }
 
 // clang-format off
@@ -148,8 +178,8 @@ layer_state_t layer_state_set_user(layer_state_t state) {
     if (!layer_state_cmp(state, 1)) {
         rapid_click_stop();
     }
-    // Auto enable scroll mode when the highest layer is 3
-    keyball_set_scroll_mode(get_highest_layer(state) == 3);
+    // Use the ball as a speed dial during rapid click, or scroll on layer 3.
+    keyball_set_scroll_mode(rapid_click_active || get_highest_layer(state) == 3);
     return state;
 }
 
@@ -158,7 +188,16 @@ layer_state_t layer_state_set_user(layer_state_t state) {
 #    include "lib/oledkit/oledkit.h"
 
 void oledkit_render_info_user(void) {
-    keyball_oled_render_keyinfo();
+    if (rapid_click_active) {
+        // Fill the same 21-character row as the normal key information.
+        oled_write_P(PSTR("Rapid: "), false);
+        oled_write_char('0' + rapid_click_rate / 100, false);
+        oled_write_char('0' + rapid_click_rate / 10 % 10, false);
+        oled_write_char('0' + rapid_click_rate % 10, false);
+        oled_write_P(PSTR(" clicks/s  "), false);
+    } else {
+        keyball_oled_render_keyinfo();
+    }
     keyball_oled_render_ballinfo();
     keyball_oled_render_layerinfo();
 }
